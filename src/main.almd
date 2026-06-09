@@ -1,0 +1,111 @@
+// CLI エントリポイント — NDJSON で append / query / wipe を受ける。
+//
+// stdin: 1 行 1 コマンド (Codec JSON)
+//   {"op":"append","event":{...MemoryEvent...}}   → ディスクに追記。id を採番して返す
+//   {"op":"query","user_id":N,"limit":M}          → 該当ユーザの末尾 M 件を返す
+//   {"op":"wipe"}                                 → ログ全消去
+//
+// stdout:
+//   append → {"ok":true,"id":N}
+//   query  → {"user_id":N,"events":[...]}
+//   wipe   → {"ok":true}
+//
+// 保存先は環境変数 FIZZ_L2_PATH (既定 "events.jsonl")。
+// 不正な行は stderr に警告して読み飛ばす。EOF で終了。
+
+import self as l2
+import fizz_protocol.memory
+import io
+import env
+import json
+import value
+import result
+import list
+import string
+import fs
+
+local fn field(v: Value, k: String) -> Value = value.get(v, k) ?? value.null()
+local fn fstr(v: Value, k: String) -> String = result.unwrap_or(value.as_string(field(v, k)), "")
+local fn fint(v: Value, k: String) -> Int = result.unwrap_or(value.as_int(field(v, k)), 0)
+
+// ファイルから全イベントを読む (無ければ空)。壊れた行は読み飛ばす。
+effect fn load_all(path: String) -> Result[List[memory.MemoryEvent], String] = {
+  let empty: List[memory.MemoryEvent] = []
+  if fs.exists(path) then {
+    let lines = fs.read_lines(path)!
+    ok(list.filter_map(lines, (ln) => l2.parse_line(ln)))
+  } else {
+    ok(empty)
+  }
+}
+
+effect fn handle_append(file: String, ev: memory.MemoryEvent) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  // event.id が 0 以下なら既存最大+1 を採番。
+  let id = if ev.id > 0 then ev.id else l2.next_id(all)
+  let stored = memory.MemoryEvent {
+    id: id, user_id: ev.user_id, session_id: ev.session_id,
+    role: ev.role, content: ev.content, ts: ev.ts, tags: ev.tags,
+  }
+  fs.append(file, l2.event_to_line(stored) + "\n")!
+  println(json.stringify(value.object([
+    ("ok", value.bool(true)), ("id", value.int(id)),
+  ])))
+  ok(())
+}
+
+effect fn handle_query(file: String, uid: Int, limit: Int) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  let evs = l2.query(all, uid, limit)
+  println(json.stringify(value.object([
+    ("user_id", value.int(uid)),
+    ("events", value.array(list.map(evs, (e) => memory.event_encode(e)))),
+  ])))
+  ok(())
+}
+
+effect fn handle_wipe(file: String) -> Result[Unit, String] = {
+  if fs.exists(file) then { fs.remove(file)! } else { () }
+  println("{\"ok\":true}")
+  ok(())
+}
+
+effect fn main() -> Unit = {
+  let path = string.trim(env.get("FIZZ_L2_PATH") ?? "")
+  let file = if path == "" then "events.jsonl" else path
+  var open = true
+  while open {
+    let line = io.read_line()
+    if string.trim(line) == "" then {
+      open = false
+    } else {
+      match json.parse(line) {
+        err(e) => eprintln("[l2-events] bad json: ${e}"),
+        ok(v)  => {
+          let op = fstr(v, "op")
+          if op == "append" then {
+            match memory.event_decode(field(v, "event")) {
+              err(e) => eprintln("[l2-events] bad event: ${e}"),
+              ok(ev) => match handle_append(file, ev) {
+                err(e) => eprintln("[l2-events] ${e}"),
+                ok(_)  => (),
+              },
+            }
+          } else if op == "query" then {
+            match handle_query(file, fint(v, "user_id"), fint(v, "limit")) {
+              err(e) => eprintln("[l2-events] ${e}"),
+              ok(_)  => (),
+            }
+          } else if op == "wipe" then {
+            match handle_wipe(file) {
+              err(e) => eprintln("[l2-events] ${e}"),
+              ok(_)  => (),
+            }
+          } else {
+            eprintln("[l2-events] unknown op: ${op}")
+          }
+        },
+      }
+    }
+  }
+}

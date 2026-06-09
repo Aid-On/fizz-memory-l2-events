@@ -1,0 +1,6 @@
+build/
+*.wasm
+*.cwasm
+fizz-memory-l2-events
+.almide/
+events.jsonl

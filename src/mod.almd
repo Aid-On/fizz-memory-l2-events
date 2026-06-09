@@ -1,0 +1,40 @@
+// fizz_memory_l2_events — 全発言の永続化と検索 (L2)。
+//
+// 責務 (一行): すべての MemoryEvent をディスクに append-only で残し、
+// user_id でクエリできるようにする。
+//
+// 旧実装は node:sqlite だったが、Almide には SQLite が無いので
+// **1 行 1 イベントの NDJSON ファイル (append-only)** に置き換えた。
+// 採番は既存最大 id + 1。クエリは全行を読み直して filter する単純実装
+// (配信規模では十分; ホットパスの即応は L1 ring が担うので L2 は許容)。
+//
+// この mod は「ファイル内容(= イベント列)」に対する純粋ロジックだけを持つ。
+// 実際の fs I/O (read_lines/append) は main 側 (effect fn) の責務。
+
+import fizz_protocol.memory
+import list
+import result
+import json
+
+// 1 イベント → JSON 1 行。
+fn event_to_line(e: memory.MemoryEvent) -> String = json.stringify(memory.event_encode(e))
+
+// 1 行 → イベント。壊れた行は none (読み飛ばす)。
+fn parse_line(line: String) -> Option[memory.MemoryEvent] =
+  match json.parse(line) {
+    err(_) => none,
+    ok(v)  => result.to_option(memory.event_decode(v)),
+  }
+
+// user_id 一致のみ抽出し、末尾 limit 件 (古い順) を返す。limit<=0 で全件。
+fn query(events: List[memory.MemoryEvent], user_id: Int, limit: Int) -> List[memory.MemoryEvent] = {
+  let mine = list.filter(events, (e) => e.user_id == user_id)
+  let n = list.len(mine)
+  if limit <= 0 then mine
+  else if n <= limit then mine
+  else list.drop(mine, n - limit)
+}
+
+// 既存最大 id + 1 (空なら 1)。append 時の採番に使う。
+fn next_id(events: List[memory.MemoryEvent]) -> Int =
+  list.fold(events, 0, (acc, e) => if e.id > acc then e.id else acc) + 1
